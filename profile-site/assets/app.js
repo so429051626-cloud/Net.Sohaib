@@ -17,18 +17,90 @@
     try { fn(); } catch (err) { if (window.console) console.error(err); }
   }
 
-  /* ───────── أداة تمرير واحدة لكل التأثيرات (بإطار رسم واحد) ───────── */
+  /* ───────── محرك التمرير: كل تأثيرات التمرير في إطار رسم واحد ─────────
+     - موقع التمرير يُقرأ مرة واحدة في كل إطار، ومواقع العناصر تُقاس مسبقاً (عند تغيّر المقاسات فقط)
+       فلا يُجبر المتصفح على إعادة حساب التصميم أثناء التمرير أبداً.
+     - مع التمرير الناعم (Lenis) تُحدَّث التأثيرات في نفس الإطار الذي تتحرك فيه الصفحة، فلا ارتجاف. */
+  var lenis = null;
   var scrollFns = [];
-  var ticking = false;
+  var measureFns = [];
+  var S = { y: 0, vh: window.innerHeight || 0, docH: 0, max: 0, section: '' }; // حالة التمرير المشتركة
+  var dirty = true;
+  var queued = false;
+  var lastY = -1;
+  var lastVh = -1;
+  var scrolling = false;
+  var scrollTimer = 0;
+  var nativeY = 0;
   function onScroll(fn) { scrollFns.push(fn); }
-  function runScroll() {
-    ticking = false;
+  function onMeasure(fn) { measureFns.push(fn); dirty = true; }
+  // موقع العنصر من أعلى الصفحة حسب التصميم نفسه (بدون أثر حركات transform)
+  function docTop(el) {
+    var t = 0;
+    while (el) { t += el.offsetTop; el = el.offsetParent; }
+    return t;
+  }
+  function measure() {
+    dirty = false;
+    nativeY = window.pageYOffset || root.scrollTop || 0;
+    S.vh = window.innerHeight || root.clientHeight;
+    S.docH = Math.max(root.scrollHeight, doc.body ? doc.body.scrollHeight : 0);
+    S.max = Math.max(0, S.docH - S.vh);
+    for (var i = 0; i < measureFns.length; i++) safe(measureFns[i]);
+  }
+  // أثناء التمرير نضيف is-scrolling للصفحة: الحركات الثقيلة الزخرفية تتوقف لحظياً حتى يبقى التمرير ناعماً
+  function endScrolling() { scrolling = false; scrollTimer = 0; root.classList.remove('is-scrolling'); }
+  function markScrolling() {
+    if (!scrolling) { scrolling = true; root.classList.add('is-scrolling'); }
+    if (scrollTimer) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(endScrolling, 180);
+  }
+  function flush() {
+    queued = false;
+    var measured = dirty;
+    if (measured) measure();
+    var y = lenis ? lenis.animatedScroll : nativeY;
+    if (!measured && y === lastY && S.vh === lastVh) return;
+    if (lastY >= 0 && y !== lastY) markScrolling();
+    lastY = y;
+    lastVh = S.vh;
+    S.y = y;
     for (var i = 0; i < scrollFns.length; i++) safe(scrollFns[i]);
   }
+  function queueFlush() {
+    if (!queued) { queued = true; requestAnimationFrame(flush); }
+  }
+  function remeasure() { dirty = true; queueFlush(); }
+  // التمرير العادي (الجوال، أو بدون التمرير الناعم): الموقع يُقرأ لحظة حدث التمرير (قبل أي تعديل في
+  // الإطار فلا يكلّف شيئاً)، والتحديث في أول إطار رسم
   window.addEventListener('scroll', function () {
-    if (!ticking) { ticking = true; requestAnimationFrame(runScroll); }
+    if (lenis) return;
+    nativeY = window.pageYOffset || root.scrollTop || 0;
+    queueFlush();
   }, { passive: true });
-  window.addEventListener('resize', function () { requestAnimationFrame(runScroll); });
+  window.addEventListener('resize', remeasure);
+  window.addEventListener('load', remeasure);
+  if (doc.fonts && doc.fonts.ready) doc.fonts.ready.then(remeasure);
+  // أي تغيّر في طول الصفحة (صور، خطوط، "مشاريع أكثر"...) يعيد القياس تلقائياً
+  if ('ResizeObserver' in window) safe(function () { new ResizeObserver(remeasure).observe(doc.body); });
+
+  // القسم الحالي (للشريط العلوي والنقاط الجانبية): يُحسب مرة واحدة لكل إطار
+  safe(function () {
+    var sections = $$('[data-section]');
+    var tops = [];
+    onMeasure(function () {
+      tops = sections.map(function (s) { return s.offsetParent === null ? Infinity : docTop(s); });
+    });
+    onScroll(function () {
+      var line = S.y + S.vh * 0.38;
+      var key = sections.length ? sections[0].getAttribute('data-section') : 'home';
+      for (var i = 0; i < sections.length; i++) {
+        if (tops[i] <= line) key = sections[i].getAttribute('data-section');
+      }
+      if (S.y + S.vh >= S.docH - 4) key = 'contact';
+      S.section = key;
+    });
+  });
 
   /* ───────── الشاشة الافتتاحية (3 ثوانٍ) ثم انسحابها للأعلى وحركة دخول الواجهة ───────── */
   safe(function () {
@@ -86,10 +158,11 @@
     doc.addEventListener('keydown', function (e) { if (e.key === 'Escape') setOpen(false); });
 
     var current = null;
+    // المؤشر يتحرك بـ transform (على كرت الشاشة) بدل left حتى لا يعيد المتصفح حساب التصميم
     var moveInd = function () {
       if (!ind || !current) return;
       if (getComputedStyle(ind).display === 'none') return;
-      ind.style.left = current.offsetLeft + 'px';
+      ind.style.transform = 'translate3d(' + current.offsetLeft + 'px,0,0)';
       ind.style.width = current.offsetWidth + 'px';
       links.classList.add('has-ind');
     };
@@ -118,17 +191,12 @@
     window.addEventListener('resize', moveInd);
     window.addEventListener('load', moveInd);
 
-    var sections = $$('[data-section]');
-    var spy = function () {
-      var line = window.innerHeight * 0.38;
-      var key = sections.length ? sections[0].getAttribute('data-section') : 'home';
-      sections.forEach(function (s) { if (s.getBoundingClientRect().top <= line) key = s.getAttribute('data-section'); });
-      if (window.innerHeight + window.scrollY >= doc.documentElement.scrollHeight - 4) key = 'contact';
-      activate(key);
-      nav.classList.toggle('is-scrolled', window.scrollY > 10);
-    };
-    onScroll(spy);
-    spy();
+    var scrolled = null;
+    onScroll(function () {
+      if (S.section) activate(S.section);
+      var s = S.y > 10;
+      if (s !== scrolled) { scrolled = s; nav.classList.toggle('is-scrolled', s); }
+    });
   });
 
   /* ───────── الوضع الليلي ───────── */
@@ -194,38 +262,78 @@
     var name = $('.hero__name');
     var photo = $('.hero__photo');
     if (!hero || reduce) return;
+    // المتصفحات الحديثة: الحركة مربوطة بالتمرير مباشرة في CSS (تعمل على كرت الشاشة، متزامنة تماماً مع الإصبع)
+    var css = window.CSS && CSS.supports;
+    if (css && CSS.supports('animation-timeline', 'scroll()') && CSS.supports('animation-range', '0px 100px')) {
+      root.classList.add('sd-parallax');
+      return;
+    }
+    var h = 0;
+    var lastN = '';
+    var lastP = '';
+    onMeasure(function () { h = hero.offsetHeight; });
     onScroll(function () {
-      var y = window.scrollY;
-      var h = hero.offsetHeight;
-      if (y > h) return;
-      if (name) name.style.transform = 'translate3d(0,' + (y * 0.32).toFixed(1) + 'px,0)';
-      if (photo) photo.style.transform = 'translate3d(0,' + (y * 0.1).toFixed(1) + 'px,0)';
+      var y = Math.min(Math.max(S.y, 0), h);
+      var n = 'translate3d(0,' + (y * 0.32).toFixed(1) + 'px,0)';
+      var p = 'translate3d(0,' + (y * 0.1).toFixed(1) + 'px,0)';
+      if (name && n !== lastN) { lastN = n; name.style.transform = n; }
+      if (photo && p !== lastP) { lastP = p; photo.style.transform = p; }
     });
   });
 
-  /* ───────── الشرائط المتحركة تتسارع مع التمرير ───────── */
-  safe(function () {
-    if (reduce) return;
-    var tracks = $$('.ribbon__track, .logos__track');
+  /* ───────── الشرائط المتحركة تتسارع مع التمرير ثم تهدأ بنعومة ─────────
+     updatePlaybackRate يغيّر السرعة بدون قفزة في مكان الشريط، والشرائط خارج الشاشة لا تُلمس */
+  function boostTracks(sel, gain, cap, decay) {
+    var tracks = $$(sel);
     if (!tracks.length || !tracks[0].getAnimations) return;
-    var lastY = window.scrollY;
+    var vis = tracks.map(function () { return true; });
     var boost = 0;
+    var rate = 1;
     var raf = 0;
-    var setRate = function (r) {
-      tracks.forEach(function (t) { t.getAnimations().forEach(function (a) { a.playbackRate = r; }); });
+    var prevY = null;
+    var prevT = 0;
+    // قائمة الحركات تُحفظ مرة واحدة (getAnimations تجبر المتصفح على حساب التصميم في كل مرة)
+    var anims = [];
+    window.addEventListener('resize', function () { anims = []; });
+    var setOne = function (i, r) {
+      if (!anims[i] || !anims[i].length) anims[i] = tracks[i].getAnimations();
+      anims[i].forEach(function (a) {
+        if (a.updatePlaybackRate) a.updatePlaybackRate(r); else a.playbackRate = r;
+      });
     };
-    var decay = function () {
-      boost *= 0.92;
-      if (boost < 0.02) { boost = 0; setRate(1); raf = 0; return; }
-      setRate(1 + boost);
-      raf = requestAnimationFrame(decay);
+    var apply = function (r, all) {
+      rate = r;
+      tracks.forEach(function (t, i) { if (all || vis[i]) setOne(i, r); });
     };
+    var step = function (t) {
+      var dt = prevT ? Math.min(64, t - prevT) : 16.7;
+      prevT = t;
+      boost *= Math.pow(decay, dt / 16.7);
+      if (boost < 0.02) { boost = 0; raf = 0; prevT = 0; apply(1, true); return; }
+      var r = Math.round((1 + boost) * 50) / 50;
+      if (r !== rate) apply(r, false);
+      raf = requestAnimationFrame(step);
+    };
+    if ('IntersectionObserver' in window) {
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) {
+          var i = tracks.indexOf(en.target);
+          if (i < 0) return;
+          if (!anims[i] || !anims[i].length) anims[i] = tracks[i].getAnimations();
+          vis[i] = en.isIntersecting;
+          if (vis[i] && rate !== 1) setOne(i, rate);
+        });
+      }, { rootMargin: '80px 0px' });
+      tracks.forEach(function (t) { io.observe(t); });
+    }
     onScroll(function () {
-      var y = window.scrollY;
-      boost = Math.min(5, boost + Math.abs(y - lastY) / 60);
-      lastY = y;
-      if (!raf) raf = requestAnimationFrame(decay);
+      if (prevY !== null) boost = Math.min(cap, boost + Math.abs(S.y - prevY) / gain);
+      prevY = S.y;
+      if (boost > 0 && !raf) raf = requestAnimationFrame(step);
     });
+  }
+  safe(function () {
+    if (!reduce) boostTracks('.ribbon__track, .logos__track', 60, 5, 0.92);
   });
 
   /* ───────── خط "لماذا أنا" يمتلئ مع التمرير ───────── */
@@ -233,18 +341,27 @@
     var tl = $('.timeline');
     if (!tl) return;
     var items = $$('.tl', tl);
-    var update = function () {
-      var r = tl.getBoundingClientRect();
-      var line = window.innerHeight * 0.62;
-      var p = Math.max(0, Math.min(1, (line - r.top) / r.height));
-      tl.style.setProperty('--p', p.toFixed(3));
-      items.forEach(function (it) {
-        var dot = it.getBoundingClientRect().top + 30;
-        it.classList.toggle('is-on', dot < line);
-      });
-    };
-    onScroll(update);
-    update();
+    // الخط الأحمر وحده يتغيّر في كل إطار (وليس كل عناصر القسم)
+    var fill = $('.timeline__fill', tl) || tl;
+    var top = 0;
+    var height = 1;
+    var dots = [];
+    var on = items.map(function () { return null; });
+    var lastP = '';
+    onMeasure(function () {
+      top = docTop(tl);
+      height = tl.offsetHeight || 1;
+      dots = items.map(function (it) { return docTop(it) + 30; });
+    });
+    onScroll(function () {
+      var line = S.y + S.vh * 0.62;
+      var p = Math.max(0, Math.min(1, (line - top) / height)).toFixed(3);
+      if (p !== lastP) { lastP = p; fill.style.setProperty('--p', p); }
+      for (var i = 0; i < items.length; i++) {
+        var o = dots[i] < line;
+        if (o !== on[i]) { on[i] = o; items[i].classList.toggle('is-on', o); }
+      }
+    });
   });
 
   /* ───────── عدّاد الأرقام ───────── */
@@ -420,13 +537,15 @@
   safe(function () {
     var top = $('.totop');
     if (!top) return;
+    var lastP = '';
+    var shown = null;
     onScroll(function () {
-      var max = doc.documentElement.scrollHeight - window.innerHeight;
-      var p = max > 0 ? window.scrollY / max : 0;
-      top.style.setProperty('--sp', p.toFixed(3));
-      top.classList.toggle('is-on', window.scrollY > 520);
+      // الدائرة طولها ~138px: نعيد رسمها فقط عندما يتغير طولها بمقدار بكسل تقريباً (لا فرق بالعين)
+      var p = (S.max > 0 ? Math.round(Math.max(0, Math.min(1, S.y / S.max)) * 150) / 150 : 0).toFixed(4);
+      if (p !== lastP) { lastP = p; top.style.setProperty('--sp', p); }
+      var o = S.y > 520;
+      if (o !== shown) { shown = o; top.classList.toggle('is-on', o); }
     });
-    runScroll();
   });
   /* ═════════════ ميزات إضافية (تُشغَّل وتُطفأ من لوحة التحكم ← الإعدادات) ═════════════ */
 
@@ -483,15 +602,20 @@
       raf = 0;
       if (!visible || doc.hidden) return;
       if (mode !== 'idle' && t - lastInput > 2600) setMode('idle');
+      // أثناء التمرير تتوقف حركة "التنفّس" (هادئة أصلاً) فيتفرغ المتصفح للتمرير، ثم تكمل بنعومة
+      if (mode === 'idle' && scrolling) { raf = requestAnimationFrame(loop); return; }
       if (mode === 'idle') {
         // حركة "تنفّس" هادئة عند عدم وجود ماوس أو حساس
         target.x = Math.sin(t / 2600) * 0.3;
         target.y = Math.cos(t / 3400) * 0.2;
       }
-      cur.x += (target.x - cur.x) * 0.075;
-      cur.y += (target.y - cur.y) * 0.075;
-      // في السكون نرسم إطاراً ونترك إطاراً (حركة هادئة أصلاً) لتوفير البطارية
-      skip = mode === 'idle' ? !skip : false;
+      var dx = target.x - cur.x;
+      var dy = target.y - cur.y;
+      cur.x += dx * 0.075;
+      cur.y += dy * 0.075;
+      // في السكون نرسم إطاراً ونترك إطاراً (حركة هادئة أصلاً) لتوفير البطارية،
+      // ومع الماوس: لا نعيد الرسم بعد أن تستقر الصورة في مكانها
+      skip = mode === 'idle' ? !skip : Math.abs(dx) + Math.abs(dy) < 0.0006;
       if (!skip) paint();
       raf = requestAnimationFrame(loop);
     };
@@ -660,41 +784,84 @@
       if (el.__scrambled) return;
       el.__scrambled = true;
       var walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
-      var nodes = [];
+      var texts = [];
       var n;
       while ((n = walker.nextNode())) {
-        if (n.nodeValue.trim()) nodes.push({ node: n, text: n.nodeValue, chars: Array.from(n.nodeValue) });
+        if (n.nodeValue.trim()) texts.push(n);
       }
-      if (!nodes.length) return;
-      var total = 0;
-      nodes.forEach(function (x) { total += x.chars.length; });
+      if (!texts.length) return;
       el.setAttribute('aria-label', el.textContent.replace(/\s+/g, ' ').trim());
       el.style.minHeight = el.offsetHeight + 'px';
+
+      // كل كلمة في عنصر مؤقت حتى نعرف سطرها. الحروف المتلخبطة لها عرض مختلف، فلو تُركت حرة
+      // قد تنتقل كلمة لسطر آخر ويقفز ما تحت العنوان أثناء التمرير. لذلك نثبّت السطور كما هي.
+      var words = [];
+      texts.forEach(function (t) {
+        var frag = doc.createDocumentFragment();
+        t.nodeValue.split(/(\s+)/).forEach(function (part) {
+          if (!part) return;
+          if (/^\s+$/.test(part)) { frag.appendChild(doc.createTextNode(part)); return; }
+          var w = doc.createElement('span');
+          w.textContent = part;
+          frag.appendChild(w);
+          words.push({ el: w, text: part, chars: Array.from(part) });
+        });
+        t.parentNode.replaceChild(frag, t);
+      });
+      var total = 0;
+      words.forEach(function (w) { total += w.chars.length; });
+      // قراءة مواقع كل الكلمات أولاً (مرة واحدة)، ثم الكتابة
+      var boxes = words.map(function (w) { return w.el.getClientRects(); });
+      // كلمة مقسومة على سطرين (نادر جداً) = لا نثبّت شيئاً ونترك السلوك المعتاد
+      var lockable = boxes.every(function (b) { return b.length <= 1; });
+      var breaks = [];
+      if (lockable) {
+        var prev = null;
+        words.forEach(function (w, i) {
+          if (!boxes[i].length) return; // كلمة داخل جزء مخفي على هذا المقاس
+          var r = boxes[i][0];
+          var mid = r.top + r.height / 2;
+          if (prev && mid > prev.mid + Math.min(prev.h, r.height) / 2) breaks.push(w.el);
+          prev = { mid: mid, h: r.height };
+        });
+        breaks = breaks.map(function (w) {
+          var br = doc.createElement('br');
+          w.parentNode.insertBefore(br, w);
+          return br;
+        });
+        el.style.whiteSpace = 'nowrap';
+      }
+      var restore = function () {
+        words.forEach(function (w) {
+          if (w.el.parentNode) w.el.parentNode.replaceChild(doc.createTextNode(w.text), w.el);
+        });
+        breaks.forEach(function (br) { if (br.parentNode) br.parentNode.removeChild(br); });
+        el.normalize();
+        el.style.whiteSpace = '';
+        el.style.minHeight = '';
+        el.removeAttribute('aria-label');
+      };
+
       var dur = clamp(450 + total * 24, 700, 1500);
       var t0 = null;
       var last = 0;
       var frame = function (t) {
         if (t0 === null) t0 = t;
         var p = (t - t0) / dur;
-        if (p >= 1) {
-          nodes.forEach(function (x) { x.node.nodeValue = x.text; });
-          el.style.minHeight = '';
-          el.removeAttribute('aria-label');
-          return;
-        }
+        if (p >= 1) { restore(); return; }
         if (t - last > 48) {
           last = t;
           var idx = 0;
-          nodes.forEach(function (x) {
+          words.forEach(function (w) {
             var out = '';
-            x.chars.forEach(function (ch) {
+            w.chars.forEach(function (ch) {
               var settle = 0.12 + (idx / total) * 0.82;
               idx++;
               if (p >= settle) { out += ch; return; }
               var g = glyph(ch);
               out += g === null ? ch : g;
             });
-            x.node.nodeValue = out;
+            if (w.el.firstChild) w.el.firstChild.nodeValue = out; else w.el.textContent = out;
           });
         }
         requestAnimationFrame(frame);
@@ -792,25 +959,33 @@
 
     var li = 0;
     var ci = 0;
-    var done = '';
-    out.innerHTML = row(caret);
+    // السطر الحالي فقط يُعاد كتابته مع كل حرف (وليس الكود كله)، فيبقى التمرير ناعماً أثناء الكتابة
+    var addRow = function (inner) {
+      var r = doc.createElement('span');
+      r.className = 'ln';
+      r.innerHTML = inner;
+      out.appendChild(r);
+      return r;
+    };
+    out.innerHTML = '';
+    var cur = addRow(caret);
     var tick = function () {
       var line = prepared[li];
       ci++;
       if (ci > line.length) {
-        done += row(paintChars(line));
         li++;
         ci = 0;
         if (li >= prepared.length) {
-          out.innerHTML = done.replace(/<\/span>$/, caret + '</span>');
+          cur.innerHTML = paintChars(line) + caret;
           setTimeout(finish, 350);
           return;
         }
-        out.innerHTML = done + row(caret);
+        cur.innerHTML = paintChars(line);
+        cur = addRow(caret);
         setTimeout(tick, line.length ? 200 : 90);
         return;
       }
-      out.innerHTML = done + row(paintChars(line.slice(0, ci)) + caret);
+      cur.innerHTML = paintChars(line.slice(0, ci)) + caret;
       var ch = line[ci - 1] ? line[ci - 1][1] : '';
       var delay = 18 + Math.random() * 34;
       if (/[,;{(]/.test(ch)) delay += 80;
@@ -830,34 +1005,50 @@
   /* ═════════════ الدفعة الثالثة: التمرير الناعم، التقدّم، المشاركة، الإحصائيات ═════════════ */
 
   /* ───────── 10) تمرير ناعم فاخر (عجلة الماوس على الكمبيوتر فقط) ───────── */
-  var lenis = null;
   safe(function () {
     if (!FX.smooth || reduce || !finePointer || typeof window.Lenis !== 'function') return;
-    lenis = new window.Lenis({
-      lerp: 0.1,
+    var l = new window.Lenis({
+      lerp: 0.08,          // انسيابية ناعمة جداً مع بقاء الاستجابة سريعة
       smoothWheel: true,
-      syncTouch: false,
+      syncTouch: false,    // اللمس يبقى تمرير الجهاز الأصلي (الأنعم على الجوال واللوحات)
       wheelMultiplier: 1,
+      touchMultiplier: 1,
       prevent: function (node) {
         return !!(node && node.closest && node.closest('.code-win__body, textarea, select, .chat__pop, .share, .nav__links, [data-lenis-prevent]'));
       }
     });
-    var raf = function (t) { lenis.raf(t); requestAnimationFrame(raf); };
-    requestAnimationFrame(raf);
+    lenis = l;
+    // Lenis أولاً في كل إطار (يطلب الإطار التالي قبل أي شيء آخر): يحرّك الصفحة،
+    // ثم تُحدَّث كل التأثيرات فوراً على نفس الموقع، فلا يتأخر أي عنصر إطاراً عن الصفحة
+    var loop = function (t) {
+      requestAnimationFrame(loop);
+      l.raf(t);
+    };
+    requestAnimationFrame(loop);
+    l.on('scroll', flush);
     if (root.classList.contains('is-loading')) {
-      lenis.stop();
-      whenReady(function () { lenis.start(); });
+      l.stop();
+      whenReady(function () { l.start(); });
     }
-    // روابط الأقسام: انتقال ناعم مع مراعاة ارتفاع الشريط العلوي
+    // روابط الأقسام: انتقال ناعم يبدأ بهدوء وينتهي بهدوء، ومدته حسب المسافة
+    var ease = function (t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
     doc.addEventListener('click', function (e) {
       var a = e.target.closest ? e.target.closest('a[href^="#"]') : null;
       if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
       var id = a.getAttribute('href');
       if (id === '#main') return; // رابط التخطي يبقى طبيعياً
-      var target = id === '#' || id === '#home' || id === '#top' ? 0 : doc.querySelector(id);
+      var target = null;
+      if (id === '#' || id === '#home' || id === '#top') target = 0;
+      else { try { target = doc.querySelector(id); } catch (err) { target = null; } }
       if (target === null) return;
       e.preventDefault();
-      lenis.scrollTo(target, { offset: target === 0 ? 0 : -86, duration: 1.3 });
+      // المسافة تحت الشريط العلوي تأتي من scroll-padding-top في CSS (يحترمها Lenis تلقائياً، مثل الجوال)
+      var pad = parseFloat(getComputedStyle(root).scrollPaddingTop) || 0;
+      var to = target === 0 ? 0 : target.getBoundingClientRect().top + l.animatedScroll - pad;
+      to = Math.max(0, Math.min(l.limit, to));
+      var dist = Math.abs(to - l.animatedScroll);
+      if (dist < 1) return;
+      l.scrollTo(target, { duration: Math.min(1.9, Math.max(0.9, 0.65 + dist / 4500)), easing: ease });
     });
   });
 
@@ -866,47 +1057,21 @@
     if (!FX.progress) return;
     var bar = $('.readbar i');
     var dots = $$('.dots a[data-dot]');
-    var sections = $$('[data-section]');
     var last = '';
-    var update = function () {
-      var max = doc.documentElement.scrollHeight - window.innerHeight;
-      if (bar) bar.style.setProperty('--rp', (max > 0 ? Math.min(1, window.scrollY / max) : 0).toFixed(4));
-      if (!dots.length) return;
-      var line = window.innerHeight * 0.38;
-      var key = sections.length ? sections[0].getAttribute('data-section') : 'home';
-      sections.forEach(function (s) { if (s.getBoundingClientRect().top <= line) key = s.getAttribute('data-section'); });
-      if (window.innerHeight + window.scrollY >= doc.documentElement.scrollHeight - 4) key = 'contact';
-      if (key === last) return;
+    var lastP = '';
+    onScroll(function () {
+      var p = (S.max > 0 ? Math.max(0, Math.min(1, S.y / S.max)) : 0).toFixed(4);
+      if (bar && p !== lastP) { lastP = p; bar.style.setProperty('--rp', p); }
+      var key = S.section;
+      if (!dots.length || !key || key === last) return;
       last = key;
       dots.forEach(function (d) { d.classList.toggle('is-on', d.getAttribute('data-dot') === key); });
-    };
-    onScroll(update);
-    update();
+    });
   });
 
   /* ───────── 12) النص العملاق: يتسارع مع التمرير مثل الشرائط ───────── */
   safe(function () {
-    if (!FX.bigtext || reduce) return;
-    var tracks = $$('.mega__track');
-    if (!tracks.length || !tracks[0].getAnimations) return;
-    var lastY = window.scrollY;
-    var boost = 0;
-    var raf = 0;
-    var setRate = function (r) {
-      tracks.forEach(function (t) { t.getAnimations().forEach(function (a) { a.playbackRate = r; }); });
-    };
-    var decay = function () {
-      boost *= 0.93;
-      if (boost < 0.02) { boost = 0; setRate(1); raf = 0; return; }
-      setRate(1 + boost);
-      raf = requestAnimationFrame(decay);
-    };
-    onScroll(function () {
-      var y = window.scrollY;
-      boost = Math.min(7, boost + Math.abs(y - lastY) / 40);
-      lastY = y;
-      if (!raf) raf = requestAnimationFrame(decay);
-    });
+    if (FX.bigtext && !reduce) boostTracks('.mega__track', 40, 7, 0.93);
   });
 
   /* ───────── 18) زر المشاركة مع QR ───────── */
@@ -1123,8 +1288,8 @@
 
     // عمق التمرير
     onScroll(function () {
-      var max = doc.documentElement.scrollHeight;
-      var d = Math.round(((window.scrollY + window.innerHeight) / max) * 100);
+      if (!S.docH) return;
+      var d = Math.round(((S.y + S.vh) / S.docH) * 100);
       if (d > visit.d) visit.d = Math.min(100, d);
     });
 
@@ -1171,4 +1336,7 @@
     });
     window.addEventListener('pagehide', send);
   });
+
+  // أول رسم لكل تأثيرات التمرير (المؤشر، شريط التقدّم، زر الأعلى...) حسب موقع الصفحة الحالي
+  flush();
 })();
